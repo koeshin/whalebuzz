@@ -1,89 +1,126 @@
 import pandas as pd
 from playwright.sync_api import sync_playwright
+from io import StringIO
 import time
 import random
+import re
 
-# 1. 수집 대상 리스트 (코드, 운용사명)
-# Dataroma URL의 'm=' 뒤에 오는 코드를 입력합니다.
+# 1. 대상 리스트 (검증된 코드 사용)
 TARGET_GURUS = [
-    {"code": "BRK", "name": "Warren Buffett (Berkshire)"},
-    {"code": "PSC", "name": "Bill Ackman (Pershing Square)"},
-    {"code": "AM",  "name": "David Tepper (Appaloosa)"},
-    {"code": "IC",  "name": "Carl Icahn (Icahn Capital)"},
-    {"code": "TP",  "name": "Daniel Loeb (Third Point)"},
-    # 필요한 만큼 계속 추가 가능
+    {"code": "SAM",     "name": "Scion Asset Mgmt (Michael Burry)"},
+    {"code": "BAUPOST", "name": "Baupost Group (Seth Klarman)"}, 
+    {"code": "BRK",     "name": "Berkshire Hathaway (Warren Buffett)"},
+    # 필요한 만큼 추가
 ]
 
-def scrape_all_gurus():
-    all_data_frames = [] # 수집된 데이터를 모을 리스트
+def scrape_ticker_history():
+    all_history_data = []
 
     with sync_playwright() as p:
-        # 브라우저 띄우기 (headless=True 권장)
+        # 브라우저 실행
         browser = p.chromium.launch(headless=True)
         context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         )
         page = context.new_page()
 
-        print(f"🚀 총 {len(TARGET_GURUS)}명의 포트폴리오 수집을 시작합니다.\n")
+        print(f"🔥 [종목 중심] 히스토리 수집을 시작합니다.\n")
 
         for guru in TARGET_GURUS:
-            code = guru["code"]
-            name = guru["name"]
-            url = f"https://www.dataroma.com/m/holdings.php?m={code}"
+            guru_code = guru["code"]
+            guru_name = guru["name"]
             
-            print(f"[{name}] 데이터 수집 중... ({url})")
+            print(f"--- [{guru_name}] 종목 발굴 시작 ---")
 
+            # Step 1: Activity 페이지에서 '건드린 종목' 리스트 확보
+            # typ=a (All)로 해야 매수/매도한 모든 종목을 찾을 수 있습니다.
+            url_activity = f"https://www.dataroma.com/m/m_activity.php?m={guru_code}&typ=a"
+            
+            unique_tickers = set() # 중복 제거를 위한 Set
+            
             try:
-                page.goto(url, timeout=30000)
-                
-                # 테이블 로딩 대기
+                page.goto(url_activity, timeout=30000)
                 page.wait_for_selector("#grid", timeout=10000)
                 
-                # HTML 파싱
-                html = page.content()
-                dfs = pd.read_html(html)
+                # 테이블 내의 모든 링크(a 태그) 중에서 'hist.php'로 가는 것만 찾음
+                # href 예시: hist.php?f=SAM&s=LULU
+                links = page.locator("#grid td.stock a").all()
                 
-                # 포트폴리오 테이블 가져오기 (보통 첫 번째 혹은 내용이 가장 많은 테이블)
-                portfolio_df = dfs[0]
-
-                # **핵심: 누구의 데이터인지 식별자 컬럼 추가**
-                portfolio_df.insert(0, "Manager_Code", code)
-                portfolio_df.insert(1, "Manager_Name", name)
+                for link in links:
+                    href = link.get_attribute("href")
+                    # 정규식으로 티커(s=???) 추출
+                    match = re.search(r's=([^&]+)', href)
+                    if match:
+                        ticker = match.group(1)
+                        unique_tickers.add(ticker)
                 
-                # 수집 날짜(Reference) 추가 (실제로는 13F 보고 기준일을 파싱해야 하지만, 지금은 수집일로 대체)
-                portfolio_df["Scraped_Date"] = pd.Timestamp.now().strftime("%Y-%m-%d")
-
-                # 리스트에 추가
-                all_data_frames.append(portfolio_df)
-                print(f"   ✅ 성공! ({len(portfolio_df)}개 종목)")
+                print(f"   👉 총 {len(unique_tickers)}개의 고유 종목 발견: {list(unique_tickers)[:5]} ...")
 
             except Exception as e:
-                print(f"   ❌ 실패: {e}")
+                print(f"   ❌ Activity 페이지 접속 실패: {e}")
+                continue
+
+            # Step 2: 각 티커별 상세 히스토리 페이지 순회
+            # (티커가 많으면 시간이 오래 걸리므로, 진행 상황을 보여줌)
+            count = 0
+            for ticker in unique_tickers:
+                count += 1
+                history_url = f"https://www.dataroma.com/m/hist/hist.php?f={guru_code}&s={ticker}"
+                print(f"   [{count}/{len(unique_tickers)}] {ticker} 분석 중...", end="\r") # 한 줄로 출력
+
+                try:
+                    page.goto(history_url, timeout=20000)
+                    # 히스토리 테이블 대기
+                    try:
+                        page.wait_for_selector("#grid", timeout=5000)
+                    except:
+                        # 데이터가 없는 경우도 있음
+                        continue
+
+                    html = page.content()
+                    dfs = pd.read_html(StringIO(html))
+                    
+                    if dfs:
+                        hist_df = dfs[0]
+                        
+                        # 컬럼 정리 (Period, Shares, % of Portfolio, Activity, % Change, Price, Value 등)
+                        # 사이트 구조상 컬럼명이 조금씩 다를 수 있어 핵심만 남김
+                        
+                        # 메타데이터 추가
+                        hist_df.insert(0, "Manager", guru_name)
+                        hist_df.insert(1, "Ticker", ticker)
+                        
+                        all_history_data.append(hist_df)
+                        
+                except Exception as e:
+                    # 특정 종목 실패해도 계속 진행
+                    pass
+                
+                # 서버 부하 방지를 위한 딜레이 (필수)
+                time.sleep(random.uniform(1.0, 2.0))
             
-            # 차단 방지를 위한 랜덤 딜레이 (2~5초)
-            time.sleep(random.uniform(2, 5))
+            print(f"\n   ✅ {guru_name} 완료.\n")
 
         browser.close()
 
-    # 2. 데이터 병합 및 저장
-    if all_data_frames:
+    # 결과 저장
+    if all_history_data:
         print("\n📊 데이터 병합 중...")
-        # 모든 DataFrame을 위아래로 합치기 (Concat)
-        master_df = pd.concat(all_data_frames, ignore_index=True)
+        master_df = pd.concat(all_history_data, ignore_index=True)
         
-        # 간단한 전처리: 컬럼명 공백 제거
-        master_df.columns = [c.strip() for c in master_df.columns]
-
-        # CSV 저장
-        filename = "all_gurus_portfolio.csv"
-        master_df.to_csv(filename, index=False, encoding="utf-8-sig") # 엑셀 깨짐 방지(utf-8-sig)
-        print(f"🎉 완료! '{filename}' 파일에 총 {len(master_df)}개의 행이 저장되었습니다.")
+        # 보기 좋게 컬럼 정리 (옵션)
+        # 보통 컬럼: Period, Shares, % of Portfolio, Activity, % Change to Portfolio, Reported Price
         
+        filename = "Guru_Ticker_Full_History.csv"
+        master_df.to_csv(filename, index=False, encoding="utf-8-sig")
+        print(f"🎉 수집 완료! '{filename}' 저장됨. (총 {len(master_df)}건의 거래 기록)")
+        
+        # 샘플 출력
+        print(master_df.head())
         return master_df
     else:
         print("수집된 데이터가 없습니다.")
         return None
 
 if __name__ == "__main__":
-    scrape_all_gurus()
+    scrape_ticker_history()
